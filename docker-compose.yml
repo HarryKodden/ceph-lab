@@ -4,6 +4,8 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/24
+  external:
+    external: true
 
 volumes:
   ceph-config:
@@ -11,11 +13,22 @@ volumes:
   mgr-data:
   osd0-data:
 
+x-ceph-common: &ceph-common
+  image: ${CEPH_IMAGE}
+  # Force amd64 — the arm64 ceph-osd build in recent Reef releases segfaults
+  # on Apple Silicon. Rosetta 2 emulation is transparent and fully functional.
+  platform: linux/amd64
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   # One-shot init: creates ceph.conf, keyrings, and initialises the monitor
   # data directory. Skips silently on subsequent `docker compose up` calls.
   bootstrap:
-    image: ${CEPH_IMAGE}
+    <<: *ceph-common
     volumes:
       - ceph-config:/etc/ceph
       - mon-data:/var/lib/ceph/mon
@@ -46,6 +59,7 @@ services:
         osd pool default min size = 1
         osd pool default pg num = 8
         osd pool default pgp num = 8
+        osd pool default pg autoscale mode = warn
         osd crush chooseleaf type = 0
         log to stderr = true
 
@@ -78,7 +92,8 @@ services:
         echo 'Bootstrap complete.'
 
   mon:
-    image: ${CEPH_IMAGE}
+    <<: *ceph-common
+    hostname: mon
     depends_on:
       bootstrap:
         condition: service_completed_successfully
@@ -101,7 +116,8 @@ services:
       start_period: 15s
 
   mgr:
-    image: ${CEPH_IMAGE}
+    <<: *ceph-common
+    hostname: mgr
     depends_on:
       mon:
         condition: service_healthy
@@ -109,21 +125,18 @@ services:
       - ceph-config:/etc/ceph
       - mgr-data:/var/lib/ceph/mgr
     networks:
+      external:
       ceph-net:
         ipv4_address: 172.20.0.11
-    # ports:
-    #   - "8080:8080"   # Ceph dashboard — uncomment together with dnf install below
+#   ports:
+#     - "8080:8080"   # Ceph dashboard (HTTP)
     restart: unless-stopped
     command:
       - bash
       - -c
       - |
         set -e
-        # Uncomment to enable the Ceph dashboard (adds ~30s to startup):
-        # dnf install -y ceph-mgr-dashboard && \
-        #   ceph mgr module enable dashboard && \
-        #   ceph config set mgr mgr/dashboard/ssl false && \
-        #   ceph dashboard set-login-credentials admin admin
+      
         mkdir -p /var/lib/ceph/mgr/ceph-mgr
         if [ ! -f /var/lib/ceph/mgr/ceph-mgr/keyring ]; then
           ceph auth get-or-create mgr.mgr \
@@ -132,10 +145,40 @@ services:
             mds 'allow *' \
             > /var/lib/ceph/mgr/ceph-mgr/keyring
         fi
+
+        # Install the dashboard package and pre-enable the module in the monitor
+        # config DB (so ceph-mgr picks it up on start). Cert, credentials, and
+        # port are configured later by the one-shot 'setup' service once the
+        # manager is fully active — they cannot be set before ceph-mgr runs.
+        dnf install -y ceph-mgr-dashboard
+        ceph mgr module enable dashboard --force || true
+
+        # Start the manager daemon in the foreground
         ceph-mgr --foreground -i mgr
+    healthcheck:
+      test: ["CMD-SHELL", "ceph mgr stat 2>/dev/null | grep -q '\"available\": true'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      # Dashboard
+      - "traefik.http.routers.ceph-dashboard.entrypoints=https"
+      - "traefik.http.routers.ceph-dashboard.rule=Host(`dashboard.pilot1.sram.surf.nl`)"
+      - "traefik.http.routers.ceph-dashboard.service=ceph-dashboard"
+      - "traefik.http.routers.ceph-dashboard.tls=true"
+      - "traefik.http.routers.ceph-dashboard.tls.certresolver=le"
+      - "traefik.http.services.ceph-dashboard.loadbalancer.server.port=8080"
+      - "traefik.http.services.ceph-dashboard.loadbalancer.server.scheme=http"
 
   osd:
-    image: ${CEPH_IMAGE}
+    <<: *ceph-common
+    # bluestore requires elevated kernel capabilities (AIO context, memory-mapped
+    # I/O, device inspection) — privileged is scoped to this container only;
+    # host networking and /dev are still not exposed.
+    hostname: osd
+    privileged: true
     depends_on:
       mon:
         condition: service_healthy
@@ -174,29 +217,71 @@ services:
 
   # RADOS Gateway — exposes an S3-compatible API on port 7480
   rgw:
-    image: ${CEPH_IMAGE}
+    <<: *ceph-common
+    hostname: rgw
     depends_on:
       osd:
         condition: service_started
       mgr:
         condition: service_started
+    env_file:
+      - .env
     volumes:
       - ceph-config:/etc/ceph
     networks:
+      external:
       ceph-net:
         ipv4_address: 172.20.0.13
-    ports:
-      - "7480:7480"   # S3 / Swift API
+#   ports:
+#     - "7480:7480"   # S3 / Swift API
     restart: unless-stopped
     command:
       - bash
       - -c
       - |
         set -e
-        # Wait until at least one OSD is up and in
-        until ceph osd stat 2>/dev/null | grep -qE '[1-9][0-9]* up'; do
-          echo 'Waiting for OSDs to be up...'; sleep 5
+
+        # Wait for cluster health — needed before any ceph/radosgw-admin calls.
+        echo 'Waiting for cluster HEALTH_OK or HEALTH_WARN...'
+        until ceph -s 2>/dev/null | grep -qE 'HEALTH_OK|HEALTH_WARN'; do
+          sleep 5
         done
+
+        # Also wait for at least 1 OSD to be active — required for pool creation
+        # and for `radosgw-admin period update --commit` to succeed.
+        echo 'Waiting for at least 1 OSD to be active...'
+        until ceph osd stat 2>/dev/null | grep -qE '[1-9][0-9]* up'; do
+          sleep 5
+        done
+
+        # Create the realm/zonegroup/zone hierarchy BEFORE starting radosgw.
+        # With a named realm, radosgw uses 'default.rgw.*' pools (no leading dot).
+        echo 'Configuring RGW realm/zonegroup/zone...'
+        radosgw-admin realm create --rgw-realm=default --default 2>/dev/null || \
+          radosgw-admin realm default --rgw-realm=default 2>/dev/null || true
+
+        radosgw-admin zonegroup create \
+          --rgw-zonegroup=default --master --default 2>/dev/null || true
+
+        radosgw-admin zone create \
+          --rgw-zonegroup=default --rgw-zone=default --master --default 2>/dev/null || \
+          radosgw-admin zone default --rgw-zone=default 2>/dev/null || true
+
+        # Register the RGW endpoint in the zone and zonegroup so the dashboard
+        # and sync-trim logic can discover and connect to it.
+        # Use the internal Docker hostname so the mgr container can reach it.
+        radosgw-admin zonegroup modify \
+          --rgw-zonegroup=default --endpoints=http://rgw:7480 2>/dev/null || true
+        radosgw-admin zone modify \
+          --rgw-zone=default --endpoints=http://rgw:7480 2>/dev/null || true
+
+        # Commit the period — retry until it succeeds so the config is live.
+        echo 'Committing RGW period...'
+        until radosgw-admin period update --commit 2>&1; do
+          echo 'Period commit not ready yet, retrying in 5s...'
+          sleep 5
+        done
+        echo 'RGW realm committed.'
 
         if [ ! -f /etc/ceph/ceph.client.rgw.default.keyring ]; then
           ceph auth get-or-create client.rgw.default \
@@ -206,7 +291,51 @@ services:
             > /etc/ceph/ceph.client.rgw.default.keyring
         fi
 
+        # Pass --rgw-realm and --rgw-zone explicitly so radosgw uses the
+        # 'default.rgw.*' pools and never falls back to legacy '.rgw.root'.
+        # --rgw-dns-name is kept here (not in config DB) so the dashboard
+        # module uses the zone endpoint for admin API discovery instead.
         radosgw --foreground \
           -n client.rgw.default \
           --keyring /etc/ceph/ceph.client.rgw.default.keyring \
+          --rgw-realm=default \
+          --rgw-zone=default \
+          --rgw-dns-name="$${RGW_DNS_NAME}" \
           --rgw-frontends 'beast endpoint=0.0.0.0:7480'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:7480/ | grep -qE '^(200|403|404)$'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    labels:
+      - "traefik.enable=true"
+      # RGW
+      - "traefik.http.routers.ceph-rgw.entrypoints=https"
+      - "traefik.http.routers.ceph-rgw.rule=Host(`ceph.pilot1.sram.surf.nl`)"
+      - "traefik.http.routers.ceph-rgw.service=ceph-rgw"
+      - "traefik.http.routers.ceph-rgw.tls=true"
+      - "traefik.http.routers.ceph-rgw.tls.certresolver=le"
+      - "traefik.http.services.ceph-rgw.loadbalancer.server.port=7480"
+      - "traefik.http.services.ceph-rgw.loadbalancer.server.scheme=http"
+
+  # One-shot finaliser: runs setup.sh once the core services are started.
+  # setup.sh waits internally for the cluster and MGR to be fully active.
+  setup:
+    <<: *ceph-common
+    depends_on:
+      mgr:
+        condition: service_healthy
+      rgw:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ceph-config:/etc/ceph
+      - ./:/work:ro
+    networks:
+      - ceph-net
+    restart: "no"
+    command:
+      - bash
+      - /work/setup.sh
