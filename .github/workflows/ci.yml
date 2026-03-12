@@ -53,8 +53,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: s3secretkey12345
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          # Ports are not published in compose; reach RGW via its container IP
-          RGW_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ceph-lab-rgw-1)
+          # Ports are not published in compose; reach RGW via its container IP on ceph-net
+          RGW_IP=$(docker inspect ceph-lab-rgw-1 | jq -r '.[0].NetworkSettings.Networks | to_entries[] | select(.key | endswith("ceph-net")) | .value.IPAddress')
           ENDPOINT="http://${RGW_IP}:7480"
           echo "RGW endpoint: $ENDPOINT"
 
@@ -74,7 +74,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: iamsecret1234567
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          RGW_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ceph-lab-rgw-1)
+          RGW_IP=$(docker inspect ceph-lab-rgw-1 | jq -r '.[0].NetworkSettings.Networks | to_entries[] | select(.key | endswith("ceph-net")) | .value.IPAddress')
           ENDPOINT="http://${RGW_IP}:7480"
 
           # List roles — demo-role should exist (created by setup.sh)
