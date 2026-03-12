@@ -32,10 +32,10 @@ Internal Docker network: ceph-net (172.20.0.0/24)
 ### Service startup order
 
 ```
-bootstrap → mon → mgr ──┐
+bootstrap → mon → mgr ───┐
                          ├──► (healthy) → setup  (one-shot finalisation)
-           mon → osd     │
-           mon → rgw ────┘ (healthy)
+            mon → osd    │
+            mon → rgw ───┘ (healthy)
 ```
 
 1. **bootstrap** — one-shot; creates `ceph.conf`, keyrings, and the monitor data directory. Skipped on subsequent starts (guarded by `.bootstrapped` flag).

@@ -17,6 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Create .env from example
+        run: cp .env.example .env
+
+      - name: Create external Docker network (Traefik stub)
+        run: docker network create external
+
       - name: Start Ceph cluster
         run: docker compose up -d
 
