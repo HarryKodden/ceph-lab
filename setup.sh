@@ -53,7 +53,9 @@ ok "MGR modules enabled."
 log "Applying cluster-wide RGW config..."
 ceph config set client.rgw rgw_enable_apis     "s3,iam,sts,admin,swift"
 ceph config set client.rgw rgw_s3_auth_use_sts true
-ceph config set client.rgw rgw_sts_key         "${RGW_STS_KEY}"
+# NOTE: rgw_sts_key is NOT set in the config DB. The running radosgw process
+# reads config at startup — a config DB change only takes effect after restart.
+# The key is passed directly via --rgw-sts-key in docker-compose.yml instead.
 ceph config rm  client.rgw debug_rgw 2>/dev/null || true
 # NOTE: rgw_dns_name is NOT set in the config DB. When set via 'ceph config set',
 # the dashboard module reads it and uses it as the admin API hostname instead of

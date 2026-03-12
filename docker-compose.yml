@@ -295,12 +295,17 @@ services:
         # 'default.rgw.*' pools and never falls back to legacy '.rgw.root'.
         # --rgw-dns-name is kept here (not in config DB) so the dashboard
         # module uses the zone endpoint for admin API discovery instead.
+        # --rgw-sts-key and --rgw-s3-auth-use-sts are passed here so they are
+        # available at process start (auth chain built at startup) before
+        # setup.sh runs ceph config set.
         radosgw --foreground \
           -n client.rgw.default \
           --keyring /etc/ceph/ceph.client.rgw.default.keyring \
           --rgw-realm=default \
           --rgw-zone=default \
           --rgw-dns-name="$${RGW_DNS_NAME}" \
+          --rgw-sts-key="$${RGW_STS_KEY}" \
+          --rgw-s3-auth-use-sts=true \
           --rgw-frontends 'beast endpoint=0.0.0.0:7480'
     healthcheck:
       test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:7480/ | grep -qE '^(200|403|404)$'"]
