@@ -1,0 +1,119 @@
+name: Validate Ceph Cluster
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CEPH_IMAGE: quay.io/ceph/ceph:v18.2.7
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Ceph cluster
+        run: docker compose up -d
+
+      - name: Wait for monitor to be healthy
+        run: |
+          echo "Waiting for monitor..."
+          timeout 120 bash -c \
+            'until docker compose exec -T mon ceph mon stat 2>/dev/null; do
+               echo "  mon not ready, retrying..."; sleep 5
+             done'
+
+      - name: Wait for OSD to be up
+        run: |
+          echo "Waiting for OSD..."
+          timeout 300 bash -c \
+            'until docker compose exec -T mon ceph osd stat 2>/dev/null \
+               | grep -qE "[1-9][0-9]* up"; do
+               echo "  OSD not up yet, retrying..."; sleep 10
+             done'
+
+      - name: Wait for RGW to be ready
+        run: |
+          echo "Waiting for RGW..."
+          timeout 120 bash -c \
+            'until curl -sf http://localhost:7480 >/dev/null 2>&1 \
+               || curl -s http://localhost:7480 | grep -qi "xml\|anonymous"; do
+               echo "  RGW not ready, retrying..."; sleep 5
+             done'
+
+      - name: Validate cluster health
+        run: |
+          echo "=== ceph status ==="
+          docker compose exec -T mon ceph status
+
+          echo "=== ceph health ==="
+          HEALTH=$(docker compose exec -T mon ceph health)
+          echo "$HEALTH"
+          # HEALTH_WARN is expected for a single-OSD test cluster;
+          # only HEALTH_ERR is a real failure.
+          if echo "$HEALTH" | grep -q "HEALTH_ERR"; then
+            echo "Cluster is in ERROR state — failing."
+            exit 1
+          fi
+
+          echo "=== ceph osd tree ==="
+          docker compose exec -T mon ceph osd tree
+
+          echo "=== ceph df ==="
+          docker compose exec -T mon ceph df
+
+      - name: Validate S3 API (RGW)
+        env:
+          AWS_ACCESS_KEY_ID: testkey
+          AWS_SECRET_ACCESS_KEY: testsecret
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          # Create a RGW user
+          docker compose exec -T mon radosgw-admin user create \
+            --uid=testuser \
+            --display-name="CI Test User" \
+            --access-key=testkey \
+            --secret-key=testsecret
+
+          ENDPOINT=http://localhost:7480
+
+          # Create bucket
+          aws --endpoint-url "$ENDPOINT" s3 mb s3://ci-test-bucket
+
+          # Put object
+          echo "Hello from Ceph CI" | \
+            aws --endpoint-url "$ENDPOINT" s3 cp - s3://ci-test-bucket/hello.txt
+
+          # List and verify
+          aws --endpoint-url "$ENDPOINT" s3 ls s3://ci-test-bucket/
+          RESULT=$(aws --endpoint-url "$ENDPOINT" s3 cp s3://ci-test-bucket/hello.txt -)
+          echo "Retrieved: $RESULT"
+          [ "$RESULT" = "Hello from Ceph CI" ] || \
+            { echo "Object content mismatch!"; exit 1; }
+
+          # Delete object and bucket
+          aws --endpoint-url "$ENDPOINT" s3 rm s3://ci-test-bucket/hello.txt
+          aws --endpoint-url "$ENDPOINT" s3 rb s3://ci-test-bucket
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== bootstrap ==="
+          docker compose logs bootstrap || true
+          echo "=== mon ==="
+          docker compose logs mon || true
+          echo "=== mgr ==="
+          docker compose logs mgr || true
+          echo "=== osd ==="
+          docker compose logs osd || true
+          echo "=== rgw ==="
+          docker compose logs rgw || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v

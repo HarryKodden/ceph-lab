@@ -1,0 +1,212 @@
+networks:
+  ceph-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  ceph-config:
+  mon-data:
+  mgr-data:
+  osd0-data:
+
+services:
+  # One-shot init: creates ceph.conf, keyrings, and initialises the monitor
+  # data directory. Skips silently on subsequent `docker compose up` calls.
+  bootstrap:
+    image: ${CEPH_IMAGE}
+    volumes:
+      - ceph-config:/etc/ceph
+      - mon-data:/var/lib/ceph/mon
+    networks:
+      - ceph-net
+    restart: "no"
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        if [ -f /etc/ceph/.bootstrapped ]; then
+          echo 'Already bootstrapped, skipping.'; exit 0
+        fi
+
+        FSID=$$(uuidgen)
+
+        cat > /etc/ceph/ceph.conf << EOF
+        [global]
+        fsid = $${FSID}
+        mon initial members = mon
+        mon host = 172.20.0.10
+        public network = 172.20.0.0/24
+        auth cluster required = cephx
+        auth service required = cephx
+        auth client required = cephx
+        osd pool default size = 1
+        osd pool default min size = 1
+        osd pool default pg num = 8
+        osd pool default pgp num = 8
+        osd crush chooseleaf type = 0
+        log to stderr = true
+
+        [osd]
+        bluestore block create = true
+        bluestore block size = 10737418240
+        EOF
+
+        # Client admin keyring
+        ceph-authtool --create-keyring /etc/ceph/ceph.client.admin.keyring \
+          --gen-key -n client.admin \
+          --cap mon 'allow *' \
+          --cap osd 'allow *' \
+          --cap mds 'allow *' \
+          --cap mgr 'allow *'
+        chmod 640 /etc/ceph/ceph.client.admin.keyring
+
+        # Mon keyring (includes admin key for bootstrap)
+        ceph-authtool --create-keyring /tmp/mon.keyring \
+          --gen-key -n mon. --cap mon 'allow *'
+        ceph-authtool /tmp/mon.keyring \
+          --import-keyring /etc/ceph/ceph.client.admin.keyring
+
+        # Build monmap and initialise mon data directory
+        monmaptool --create --add mon 172.20.0.10 --fsid "$${FSID}" /tmp/monmap
+        mkdir -p /var/lib/ceph/mon/ceph-mon
+        ceph-mon --mkfs -i mon --monmap /tmp/monmap --keyring /tmp/mon.keyring
+
+        touch /etc/ceph/.bootstrapped
+        echo 'Bootstrap complete.'
+
+  mon:
+    image: ${CEPH_IMAGE}
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    volumes:
+      - ceph-config:/etc/ceph
+      - mon-data:/var/lib/ceph/mon
+    networks:
+      ceph-net:
+        ipv4_address: 172.20.0.10
+    restart: unless-stopped
+    command:
+      - bash
+      - -c
+      - ceph-mon --foreground -i mon
+    healthcheck:
+      test: ["CMD", "ceph", "mon", "stat"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+
+  mgr:
+    image: ${CEPH_IMAGE}
+    depends_on:
+      mon:
+        condition: service_healthy
+    volumes:
+      - ceph-config:/etc/ceph
+      - mgr-data:/var/lib/ceph/mgr
+    networks:
+      ceph-net:
+        ipv4_address: 172.20.0.11
+    # ports:
+    #   - "8080:8080"   # Ceph dashboard — uncomment together with dnf install below
+    restart: unless-stopped
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        # Uncomment to enable the Ceph dashboard (adds ~30s to startup):
+        # dnf install -y ceph-mgr-dashboard && \
+        #   ceph mgr module enable dashboard && \
+        #   ceph config set mgr mgr/dashboard/ssl false && \
+        #   ceph dashboard set-login-credentials admin admin
+        mkdir -p /var/lib/ceph/mgr/ceph-mgr
+        if [ ! -f /var/lib/ceph/mgr/ceph-mgr/keyring ]; then
+          ceph auth get-or-create mgr.mgr \
+            mon 'allow profile mgr' \
+            osd 'allow *' \
+            mds 'allow *' \
+            > /var/lib/ceph/mgr/ceph-mgr/keyring
+        fi
+        ceph-mgr --foreground -i mgr
+
+  osd:
+    image: ${CEPH_IMAGE}
+    depends_on:
+      mon:
+        condition: service_healthy
+    volumes:
+      - ceph-config:/etc/ceph
+      - osd0-data:/var/lib/ceph/osd
+    networks:
+      ceph-net:
+        ipv4_address: 172.20.0.12
+    restart: unless-stopped
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        mkdir -p /var/lib/ceph/osd/ceph-0
+
+        if [ ! -f /var/lib/ceph/osd/ceph-0/type ]; then
+          # Create auth key for osd.0 in the monitor
+          ceph auth get-or-create osd.0 \
+            mon 'allow profile osd' \
+            osd 'allow *' \
+            mgr 'allow profile osd' \
+            > /var/lib/ceph/osd/ceph-0/keyring
+
+          # bluestore creates its own block file (10 GiB) under the osd data dir
+          ceph-osd -i 0 --mkfs
+
+          # Register in CRUSH map
+          ceph osd crush add-bucket ceph-node host
+          ceph osd crush move ceph-node root=default
+          ceph osd crush add 0 1.0 host=ceph-node
+        fi
+
+        ceph-osd --foreground -i 0
+
+  # RADOS Gateway — exposes an S3-compatible API on port 7480
+  rgw:
+    image: ${CEPH_IMAGE}
+    depends_on:
+      osd:
+        condition: service_started
+      mgr:
+        condition: service_started
+    volumes:
+      - ceph-config:/etc/ceph
+    networks:
+      ceph-net:
+        ipv4_address: 172.20.0.13
+    ports:
+      - "7480:7480"   # S3 / Swift API
+    restart: unless-stopped
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        # Wait until at least one OSD is up and in
+        until ceph osd stat 2>/dev/null | grep -qE '[1-9][0-9]* up'; do
+          echo 'Waiting for OSDs to be up...'; sleep 5
+        done
+
+        if [ ! -f /etc/ceph/ceph.client.rgw.default.keyring ]; then
+          ceph auth get-or-create client.rgw.default \
+            osd 'allow rwx' \
+            mon 'allow rw' \
+            mgr 'allow rw' \
+            > /etc/ceph/ceph.client.rgw.default.keyring
+        fi
+
+        radosgw --foreground \
+          -n client.rgw.default \
+          --keyring /etc/ceph/ceph.client.rgw.default.keyring \
+          --rgw-frontends 'beast endpoint=0.0.0.0:7480'
