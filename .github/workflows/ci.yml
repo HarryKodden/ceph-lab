@@ -23,34 +23,8 @@ jobs:
       - name: Create external Docker network (Traefik stub)
         run: docker network create external
 
-      - name: Start Ceph cluster
-        run: docker compose up -d
-
-      - name: Wait for monitor to be healthy
-        run: |
-          echo "Waiting for monitor..."
-          timeout 120 bash -c \
-            'until docker compose exec -T mon ceph mon stat 2>/dev/null; do
-               echo "  mon not ready, retrying..."; sleep 5
-             done'
-
-      - name: Wait for OSD to be up
-        run: |
-          echo "Waiting for OSD..."
-          timeout 300 bash -c \
-            'until docker compose exec -T mon ceph osd stat 2>/dev/null \
-               | grep -qE "[1-9][0-9]* up"; do
-               echo "  OSD not up yet, retrying..."; sleep 10
-             done'
-
-      - name: Wait for RGW to be ready
-        run: |
-          echo "Waiting for RGW..."
-          timeout 120 bash -c \
-            'until curl -sf http://localhost:7480 >/dev/null 2>&1 \
-               || curl -s http://localhost:7480 | grep -qi "xml\|anonymous"; do
-               echo "  RGW not ready, retrying..."; sleep 5
-             done'
+      - name: Start Ceph cluster and wait for healthy
+        run: docker compose up -d --wait --wait-timeout 600
 
       - name: Validate cluster health
         run: |
@@ -75,36 +49,62 @@ jobs:
 
       - name: Validate S3 API (RGW)
         env:
-          AWS_ACCESS_KEY_ID: testkey
-          AWS_SECRET_ACCESS_KEY: testsecret
+          AWS_ACCESS_KEY_ID: s3accesskey12345
+          AWS_SECRET_ACCESS_KEY: s3secretkey12345
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          # Create a RGW user
-          docker compose exec -T mon radosgw-admin user create \
-            --uid=testuser \
-            --display-name="CI Test User" \
-            --access-key=testkey \
-            --secret-key=testsecret
+          # Ports are not published in compose; reach RGW via its container IP
+          RGW_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ceph-lab-rgw-1)
+          ENDPOINT="http://${RGW_IP}:7480"
+          echo "RGW endpoint: $ENDPOINT"
 
-          ENDPOINT=http://localhost:7480
-
-          # Create bucket
           aws --endpoint-url "$ENDPOINT" s3 mb s3://ci-test-bucket
+          aws --endpoint-url "$ENDPOINT" s3 cp - s3://ci-test-bucket/hello.txt <<< "Hello from Ceph CI"
 
-          # Put object
-          echo "Hello from Ceph CI" | \
-            aws --endpoint-url "$ENDPOINT" s3 cp - s3://ci-test-bucket/hello.txt
-
-          # List and verify
-          aws --endpoint-url "$ENDPOINT" s3 ls s3://ci-test-bucket/
           RESULT=$(aws --endpoint-url "$ENDPOINT" s3 cp s3://ci-test-bucket/hello.txt -)
           echo "Retrieved: $RESULT"
-          [ "$RESULT" = "Hello from Ceph CI" ] || \
-            { echo "Object content mismatch!"; exit 1; }
+          [ "$RESULT" = "Hello from Ceph CI" ] || { echo "Object content mismatch!"; exit 1; }
 
-          # Delete object and bucket
           aws --endpoint-url "$ENDPOINT" s3 rm s3://ci-test-bucket/hello.txt
           aws --endpoint-url "$ENDPOINT" s3 rb s3://ci-test-bucket
+
+      - name: Validate IAM API (RGW)
+        env:
+          AWS_ACCESS_KEY_ID: iamaccess123456
+          AWS_SECRET_ACCESS_KEY: iamsecret1234567
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          RGW_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ceph-lab-rgw-1)
+          ENDPOINT="http://${RGW_IP}:7480"
+
+          # List roles — demo-role should exist (created by setup.sh)
+          echo "=== Listing IAM roles ==="
+          aws --endpoint-url "$ENDPOINT" iam list-roles
+
+          ROLE_ARN=$(aws --endpoint-url "$ENDPOINT" iam list-roles \
+            --query 'Roles[?RoleName==`demo-role`].Arn' \
+            --output text)
+          echo "demo-role ARN: $ROLE_ARN"
+          [ -n "$ROLE_ARN" ] || { echo "demo-role not found!"; exit 1; }
+
+          # List users
+          echo "=== Listing IAM users ==="
+          aws --endpoint-url "$ENDPOINT" iam list-users
+
+          # Assume demo-role as s3user via STS
+          echo "=== Assuming demo-role via STS ==="
+          STS_CREDS=$(AWS_ACCESS_KEY_ID=s3accesskey12345 \
+                      AWS_SECRET_ACCESS_KEY=s3secretkey12345 \
+                      aws --endpoint-url "$ENDPOINT" sts assume-role \
+                        --role-arn "$ROLE_ARN" \
+                        --role-session-name ci-test-session \
+                        --output json)
+          echo "$STS_CREDS" | python3 -c "
+          import sys, json
+          c = json.load(sys.stdin)['Credentials']
+          print('AccessKeyId:', c['AccessKeyId'][:8], '...')
+          print('SessionToken present:', bool(c.get('SessionToken')))
+          "
 
       - name: Collect logs on failure
         if: failure()
