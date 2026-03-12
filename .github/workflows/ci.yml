@@ -87,10 +87,6 @@ jobs:
           echo "demo-role ARN: $ROLE_ARN"
           [ -n "$ROLE_ARN" ] || { echo "demo-role not found!"; exit 1; }
 
-          # List users
-          echo "=== Listing IAM users ==="
-          aws --endpoint-url "$ENDPOINT" iam list-users
-
           # Assume demo-role as s3user via STS
           echo "=== Assuming demo-role via STS ==="
           STS_CREDS=$(AWS_ACCESS_KEY_ID=s3accesskey12345 \
